@@ -1,4 +1,4 @@
-# pip install deepface mediapipe opencv-python pandas
+# pip install deepface mediapipe opencv-python pandas tf-keras
 
 from deepface import DeepFace
 import cv2
@@ -25,9 +25,8 @@ dict_emotion_kor = {
     "happy": "행복", "sad": "슬픔", "surprise": "놀람", "neutral": "무표정"
 }
 
-# MediaPipe 초기화
 mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True)
+face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True, refine_landmarks=True)
 
 results = []
 
@@ -39,11 +38,16 @@ for name, path in image_files.items():
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     mediapipe_result = face_mesh.process(rgb)
 
+    # 초기값
     mouth_width = None
     mouth_open_ratio = None
     slope = None
     cheek_diff = None
     lip_asymmetry = None
+    eyebrow_hidden = "판단불가"
+    ear_hidden = "판단불가"
+    gaze_result = "판단불가"
+    face_straight = "판단불가"
     judgment = "판단 불가"
 
     if mediapipe_result.multi_face_landmarks:
@@ -54,40 +58,75 @@ for name, path in image_files.items():
             lm = landmarks.landmark[idx]
             return lm.x * w, lm.y * h
 
-        # 입 좌표
-        x1, y1 = get_xy(61)   # 왼쪽 입꼬리
-        x2, y2 = get_xy(291)  # 오른쪽 입꼬리
-        xtop, ytop = get_xy(13)  # 입 위
-        xbot, ybot = get_xy(14)  # 입 아래
+        def get_x(idx):
+            return landmarks.landmark[idx].x * w
 
-        # 광대 좌표
+        def get_y(idx):
+            return landmarks.landmark[idx].y * h
+
+        # 입 관련 좌표
+        x1, y1 = get_xy(61)
+        x2, y2 = get_xy(291)
+        xtop, ytop = get_xy(13)
+        xbot, ybot = get_xy(14)
+
+        # 광대
         _, cheek_left_y = get_xy(234)
         _, cheek_right_y = get_xy(454)
         cheek_diff = abs(cheek_left_y - cheek_right_y)
 
-        # 코 중심
+        # 중심
         xnose, _ = get_xy(2)
         lip_center_x = (x1 + x2) / 2
         center_offset = abs(xnose - lip_center_x)
 
-        # 입 비대칭
-        lip_asymmetry = abs(y1 - y2)
-
-        # 입 관련 계산
+        # 입 계산
         mouth_width = abs(x2 - x1)
         mouth_open = abs(ybot - ytop)
         mouth_open_ratio = mouth_open / mouth_width if mouth_width else 0
         slope = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else 0
+        lip_asymmetry = abs(y1 - y2)
 
-        # ✅ 최종 적합 판단 기준
+        # ✅ 눈썹 가림 추정
+        LEFT_EYEBROW = [65, 66, 67, 68, 69]
+        LEFT_EYE = 159
+        eyebrow_diffs = [abs(get_y(e) - get_y(LEFT_EYE)) for e in LEFT_EYEBROW]
+        avg_eyebrow_diff = sum(eyebrow_diffs) / len(eyebrow_diffs)
+        eyebrow_hidden = "⭕ 보임" if avg_eyebrow_diff >= 3.5 else "❌ 가림 의심"
+
+        # ✅ 귀 노출 추정
+        face_width = abs(get_x(454) - get_x(234))
+        ear_hidden = "⭕ 보임" if face_width >= (w * 0.35) else "❌ 가림 의심"
+
+        # ✅ 시선 정면 추정
+        def estimate_gaze(outer, inner, center_idx):
+            outer_x = get_x(outer)
+            inner_x = get_x(inner)
+            center_x = get_x(center_idx)
+            eye_width = abs(outer_x - inner_x)
+            rel = abs(center_x - (outer_x + inner_x) / 2)
+            return rel / eye_width if eye_width else 1.0
+
+        gaze_left = estimate_gaze(33, 133, 468)
+        gaze_right = estimate_gaze(362, 263, 473)
+        gaze_result = "⭕ 정면 응시" if gaze_left < 0.25 and gaze_right < 0.25 else "❌ 시선 이탈"
+
+        # ✅ 얼굴 정면 여부 (코 좌표가 얼굴 중앙인지)
+        x_left_face = get_x(127)
+        x_right_face = get_x(356)
+        face_center_x = (x_left_face + x_right_face) / 2
+        nose_offset = abs(xnose - face_center_x)
+        face_straight = "⭕ 정면" if nose_offset < (w * 0.03) else "❌ 측면"
+
+        # ✅ 최종 판단
         if (
             (dominant_emotion in ["neutral", "happy"]) and
             (mouth_open_ratio < 0.12) and
             (mouth_width < 60) and
             (slope <= 0.05) and
-            (lip_asymmetry < 4.0) and       # 입꼬리 좌우 높이차
-            (cheek_diff < 6.0) and          # 광대 높이 비대칭 허용
-            (center_offset < 10.0)          # 입 중앙과 코 수직선의 차
+            (lip_asymmetry < 4.0) and
+            (cheek_diff < 6.0) and
+            (center_offset < 10.0)
         ):
             judgment = "⭕ 적합"
         else:
@@ -102,11 +141,14 @@ for name, path in image_files.items():
         "입꼬리비대칭": round(lip_asymmetry, 2) if lip_asymmetry else "N/A",
         "광대비대칭": round(cheek_diff, 2) if cheek_diff else "N/A",
         "입중앙오프셋": round(center_offset, 2) if center_offset else "N/A",
+        "눈썹가림": eyebrow_hidden,
+        "귀노출": ear_hidden,
+        "시선정면": gaze_result,
+        "얼굴정면": face_straight,
         "최종 판단": judgment
     })
 
 # 결과 출력
-import pandas as pd
 df = pd.DataFrame(results)
 print("\n📊 최종 판단 결과:")
 print(df)
